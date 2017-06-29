@@ -32,7 +32,8 @@ const (
 
 var (
 	// Packet should hold two int64 fields
-	PACKET_SIZE uint64 = uint64(unsafe.Sizeof(PACKET_SIZE) * 2)
+	MIN_PACKET_SIZE int = int(unsafe.Sizeof(sentPackets) * 2)
+	MAX_PACKET_SIZE int = 1400
 
 	sentPackets     uint64     = 0
 	receivedPackets uint64     = 0
@@ -40,6 +41,7 @@ var (
 	passed          int32      = 1
 	rnd             *rand.Rand
 
+	hwol            bool
 	inport          uint
 	outport         uint
 	useIPv4         bool
@@ -50,6 +52,7 @@ var (
 	useTCP          bool
 	randomL4        bool = false
 	l4type          int
+	packetLength    int
 )
 
 // This part of test generates packets on port 0 and receives them on
@@ -61,12 +64,14 @@ var (
 // calculates sent/received ratio and prints it when a predefined
 // number of packets is received.
 func main() {
+	flag.BoolVar(&hwol, "hwol", false, "Use Hardware offloading for TX checksums calculation")
 	flag.UintVar(&inport, "inport", 1, "Input port number")
 	flag.UintVar(&outport, "outport", 0, "Output port number")
 	flag.BoolVar(&useUDP, "udp", false, "Generate UDP packets")
 	flag.BoolVar(&useTCP, "tcp", false, "Generate TCP packets")
 	flag.BoolVar(&useIPv4, "ipv4", false, "Generate IPv4 packets")
 	flag.BoolVar(&useIPv6, "ipv6", false, "Generate IPv6 packets")
+	flag.IntVar(&packetLength, "size", 0, "Specify length of packets to be generated")
 
 	rnd = rand.New(rand.NewSource(13))
 
@@ -142,6 +147,14 @@ func main() {
 	}
 }
 
+func generatePacketLength() uint16 {
+	if packetLength == 0 {
+		return uint16(rnd.Intn(MAX_PACKET_SIZE - MIN_PACKET_SIZE) + MIN_PACKET_SIZE)
+	} else {
+		return uint16(packetLength)
+	}
+}
+
 func generatePacket(emptyPacket *packet.Packet, context flow.UserContext) {
 	if randomL3 {
 		l3type = rnd.Intn(MAXL3)
@@ -167,74 +180,87 @@ func generatePacket(emptyPacket *packet.Packet, context flow.UserContext) {
 	atomic.AddUint64(&sentPackets, 1)
 }
 
-func initPacketCommon(emptyPacket *packet.Packet) {
-	emptyPacket.Ether.DAddr = [6]uint8{0xde, 0xad, 0xbe, 0xef, 0xff, 0xfe}
+func initPacketCommon(emptyPacket *packet.Packet, length uint16) {
+	// Initialize ethernet addresses
+	emptyPacket.Ether.DAddr = [6]uint8{0xde, 0xea, 0xad, 0xbe, 0xee, 0xef}
 	emptyPacket.Ether.SAddr = [6]uint8{0x11, 0x22, 0x33, 0x44, 0x55, 0x66}
 
+	// Fill internals with random garbage
+	data := (*[1 << 30]byte)(emptyPacket.Data)[0: length]
+	for i := range data {
+		data[i] = byte(rnd.Int())
+	}
+
+	// Put a unique non-zero value here
 	sent := atomic.LoadUint64(&sentPackets)
 	ptr := (*common.Packetdata)(emptyPacket.Data)
-	// Put a unique non-zero value here
-	ptr.F1 = rnd.Uint64() + sent + 1
-	ptr.F2 = rnd.Uint64()
+	ptr.F1 = sent + 1
+	ptr.F2 = 0
 }
 
 func initPacketIPv4(emptyPacket *packet.Packet) {
-	emptyPacket.IPv4.HdrChecksum = 0
+	// Initialize IPv4 addresses
 	emptyPacket.IPv4.SrcAddr = packet.SwapBytesUint32((192 << 24) | (168 << 16) | (1 << 8) | 1)
 	emptyPacket.IPv4.DstAddr = packet.SwapBytesUint32((192 << 24) | (168 << 16) | (1 << 8) | 2)
+	emptyPacket.IPv4.HdrChecksum = 0
 	emptyPacket.IPv4.TimeToLive = 100
 }
 
 func initPacketIPv6(emptyPacket *packet.Packet) {
+	// Initialize IPv6 addresses
 	emptyPacket.IPv6.SrcAddr = [packet.IPv6AddrLen]uint8{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	emptyPacket.IPv6.DstAddr = [packet.IPv6AddrLen]uint8{17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32}
 }
 
-func initPacketUDP(emptyPacket *packet.Packet) {
+func initPacketUDP(emptyPacket *packet.Packet, length uint16) {
 	emptyPacket.UDP.SrcPort = packet.SwapBytesUint16(1234)
 	emptyPacket.UDP.DstPort = packet.SwapBytesUint16(2345)
-	emptyPacket.UDP.DgramLen = packet.SwapBytesUint16(uint16(PACKET_SIZE))
+	emptyPacket.UDP.DgramLen = packet.SwapBytesUint16(length)
 }
 
-func initPacketTCP(emptyPacket *packet.Packet) {
+func initPacketTCP(emptyPacket *packet.Packet, length uint16) {
 }
 
 func generateIPv4UDP(emptyPacket *packet.Packet) {
-	packet.InitEmptyEtherIPv4UDPPacket(emptyPacket, uint(PACKET_SIZE))
+	length := generatePacketLength()
+	packet.InitEmptyEtherIPv4UDPPacket(emptyPacket, uint(length))
 
-	initPacketCommon(emptyPacket)
+	initPacketCommon(emptyPacket, length)
 	initPacketIPv4(emptyPacket)
-	initPacketUDP(emptyPacket)
+	initPacketUDP(emptyPacket, length)
 
 	common.CalculateIPv4UDPChecksum(emptyPacket)
 }
 
 func generateIPv4TCP(emptyPacket *packet.Packet) {
-	packet.InitEmptyEtherIPv4TCPPacket(emptyPacket, uint(PACKET_SIZE))
+	length := generatePacketLength()
+	packet.InitEmptyEtherIPv4TCPPacket(emptyPacket, uint(length))
 
-	initPacketCommon(emptyPacket)
+	initPacketCommon(emptyPacket, length)
 	initPacketIPv4(emptyPacket)
-	initPacketTCP(emptyPacket)
+	initPacketTCP(emptyPacket, length)
 
 	common.CalculateIPv4TCPChecksum(emptyPacket)
 }
 
 func generateIPv6UDP(emptyPacket *packet.Packet) {
-	packet.InitEmptyEtherIPv4UDPPacket(emptyPacket, uint(PACKET_SIZE))
+	length := generatePacketLength()
+	packet.InitEmptyEtherIPv4UDPPacket(emptyPacket, uint(length))
 
-	initPacketCommon(emptyPacket)
+	initPacketCommon(emptyPacket, length)
 	initPacketIPv6(emptyPacket)
-	initPacketUDP(emptyPacket)
+	initPacketUDP(emptyPacket, length)
 
 	common.CalculateIPv6UDPChecksum(emptyPacket)
 }
 
 func generateIPv6TCP(emptyPacket *packet.Packet) {
-	packet.InitEmptyEtherIPv6TCPPacket(emptyPacket, uint(PACKET_SIZE))
+	length := generatePacketLength()
+	packet.InitEmptyEtherIPv6TCPPacket(emptyPacket, uint(length))
 
-	initPacketCommon(emptyPacket)
+	initPacketCommon(emptyPacket, length)
 	initPacketIPv6(emptyPacket)
-	initPacketTCP(emptyPacket)
+	initPacketTCP(emptyPacket, length)
 
 	common.CalculateIPv6TCPChecksum(emptyPacket)
 }

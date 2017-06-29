@@ -17,7 +17,9 @@ import (
 // Main function for constructing packet processing graph.
 func main() {
 	var inport, outport uint
+	var hwol bool
 
+	flag.BoolVar(&hwol, "hwol", false, "Use Hardware offloading for TX checksums calculation")
 	flag.UintVar(&inport, "inport", 0, "Input port number")
 	flag.UintVar(&outport, "outport", 1, "Output port number")
 
